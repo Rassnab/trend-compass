@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Activity, Play, Loader2, CheckCircle, AlertCircle, Clock, FileText } from "lucide-react";
+import { Activity, Play, Loader2, CheckCircle, AlertCircle, Clock, FileText, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { supabase } from "@/integrations/supabase/client";
@@ -113,6 +113,30 @@ export default function IngestionStatus() {
     setTriggering(false);
   };
 
+  const [resetting, setResetting] = useState(false);
+
+  const resetAll = async () => {
+    if (!confirm("This will delete ALL claims, chunks, theme mappings, tension evidence, scores, audit logs, and ingestion batches, then reset all reports to 'pending'. Continue?")) return;
+    setResetting(true);
+    try {
+      // Delete in dependency order
+      await supabase.from("claim_theme_map").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("tension_evidence").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("theme_scores").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("tension_scores").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("claims").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("chunks").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("audit_logs").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("reports").update({ status: "pending", error_message: null, batch_id: null }).neq("id", "00000000-0000-0000-0000-000000000000");
+      await supabase.from("ingestion_batches").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      toast.success("All ingestion data reset. Reports are pending.");
+      await fetchData();
+    } catch (err: any) {
+      toast.error(err.message || "Reset failed");
+    }
+    setResetting(false);
+  };
+
   const statusIcon = (status: string) => {
     switch (status) {
       case "succeeded": return <CheckCircle className="h-4 w-4 text-accent" />;
@@ -157,7 +181,20 @@ export default function IngestionStatus() {
             ) : (
               <Play className="mr-2 h-4 w-4" />
             )}
-            Trigger Ingestion
+           Trigger Ingestion
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={resetAll}
+            disabled={resetting || triggering}
+          >
+            {resetting ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <RotateCcw className="mr-2 h-4 w-4" />
+            )}
+            Reset All
           </Button>
         </div>
       </div>
