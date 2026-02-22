@@ -7,13 +7,13 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY")!;
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 // ─── Helpers ───────────────────────────────────────────────
 
@@ -21,10 +21,10 @@ async function llmChat(messages: any[], temperature = 0.2, maxTokens = 4000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 90_000);
   try {
-    const res = await fetch(AI_GATEWAY, {
+    const res = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
-      headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "google/gemini-2.5-flash", messages, temperature, max_tokens: maxTokens }),
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages, temperature, max_tokens: maxTokens }),
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -39,7 +39,6 @@ async function llmChat(messages: any[], temperature = 0.2, maxTokens = 4000) {
 }
 
 async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
-  const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 90_000);
   try {
@@ -645,8 +644,8 @@ serve(async (req) => {
     await supabase.from("audit_logs").insert({
       batch_id,
       action: "ingestion_complete",
-      model_provider: "lovable-ai-gateway",
-      model_name: "gemini-2.5-flash / text-embedding-3-small",
+      model_provider: "openai",
+      model_name: "gpt-4o-mini / text-embedding-3-small",
       details: { reports_processed: processed, claims_extracted: totalClaims, errors },
     });
 
