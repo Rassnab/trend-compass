@@ -80,19 +80,31 @@ export default function IngestionStatus() {
 
       if (updateErr) throw updateErr;
 
-      toast.info(`Batch created. Starting ingestion of ${pendingReports.length} reports...`);
+      toast.info(`Batch created. Starting ingestion of ${pendingReports.length} reports (processing in batches of 3)...`);
       await fetchData();
 
-      // Call the ingestion edge function
-      const { data: fnData, error: fnError } = await supabase.functions.invoke("ingest", {
-        body: { batch_id: batch.id },
-      });
+      // Loop: call edge function until all reports are processed
+      let totalProcessed = 0;
+      let totalClaims = 0;
+      let hasMore = true;
 
-      if (fnError) throw fnError;
+      while (hasMore) {
+        const { data: fnData, error: fnError } = await supabase.functions.invoke("ingest", {
+          body: { batch_id: batch.id },
+        });
 
-      if (fnData?.error) throw new Error(fnData.error);
+        if (fnError) throw fnError;
+        if (fnData?.error) throw new Error(fnData.error);
 
-      toast.success(`Ingestion complete: ${fnData.processed} reports, ${fnData.totalClaims} claims extracted`);
+        totalProcessed += fnData.processed || 0;
+        totalClaims += fnData.totalClaims || 0;
+        hasMore = fnData.hasMore || false;
+
+        toast.info(`Processed ${totalProcessed}/${pendingReports.length} reports so far...`);
+        await fetchData();
+      }
+
+      toast.success(`Ingestion complete: ${totalProcessed} reports, ${totalClaims} claims extracted`);
       await fetchData();
     } catch (err: any) {
       toast.error(err.message || "Failed to run ingestion");

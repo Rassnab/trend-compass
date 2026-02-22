@@ -104,7 +104,7 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
   return pages.length ? pages : ["[No extractable text found in PDF]"];
 }
 
-function chunkText(pages: string[], targetTokens = 1000): { text: string; pageStart: number; pageEnd: number }[] {
+function chunkText(pages: string[], targetTokens = 400): { text: string; pageStart: number; pageEnd: number }[] {
   const chunks: { text: string; pageStart: number; pageEnd: number }[] = [];
   let current = "";
   let currentStart = 1;
@@ -119,7 +119,7 @@ function chunkText(pages: string[], targetTokens = 1000): { text: string; pageSt
     const combined = current ? current + "\n\n" + pageText : pageText;
     const approxTokens = combined.split(/\s+/).length;
 
-    if (approxTokens > targetTokens * 1.5 && current) {
+    if (approxTokens > targetTokens && current) {
       chunks.push({ text: current, pageStart: currentStart, pageEnd: pageNum - 1 });
       current = pageText;
       currentStart = pageNum;
@@ -132,7 +132,29 @@ function chunkText(pages: string[], targetTokens = 1000): { text: string; pageSt
     chunks.push({ text: current, pageStart: currentStart, pageEnd: pages.length });
   }
 
-  return chunks;
+  // Hard-split any chunk that's still too large (>6000 chars ≈ 1500 tokens)
+  const MAX_CHARS = 6000;
+  const safechunks: typeof chunks = [];
+  for (const c of chunks) {
+    if (c.text.length <= MAX_CHARS) {
+      safechunks.push(c);
+    } else {
+      // Split by sentences
+      const sentences = c.text.match(/[^.!?]+[.!?]+/g) || [c.text];
+      let buf = "";
+      for (const s of sentences) {
+        if ((buf + s).length > MAX_CHARS && buf) {
+          safechunks.push({ text: buf.trim(), pageStart: c.pageStart, pageEnd: c.pageEnd });
+          buf = s;
+        } else {
+          buf += s;
+        }
+      }
+      if (buf.trim()) safechunks.push({ text: buf.trim(), pageStart: c.pageStart, pageEnd: c.pageEnd });
+    }
+  }
+
+  return safechunks;
 }
 
 // ─── Main Pipeline ─────────────────────────────────────────
@@ -161,7 +183,7 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   // 4. Embed & store chunks
   const chunkIds: string[] = [];
   for (const chunk of rawChunks) {
-    const embedding = await openaiEmbedding(chunk.text.slice(0, 8000));
+    const embedding = await openaiEmbedding(chunk.text.slice(0, 6000));
     const { data: inserted, error } = await supabase
       .from("chunks")
       .insert({
@@ -416,8 +438,9 @@ serve(async (req) => {
     // Get batch
     await supabase.from("ingestion_batches").update({ status: "running", started_at: new Date().toISOString() }).eq("id", batch_id);
 
-    // Get reports in batch
-    const { data: reports } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending");
+    // Get reports in batch — limit to 3 per invocation to avoid memory limits
+    const MAX_PER_INVOCATION = 3;
+    const { data: reports } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending").limit(MAX_PER_INVOCATION);
     if (!reports || reports.length === 0) throw new Error("No pending reports in batch");
 
     // Get taxonomy
@@ -441,18 +464,21 @@ serve(async (req) => {
       }
     }
 
-    // Compute scores
-    await computeScores(batch_id);
+    // Check if more pending reports remain
+    const { data: remaining } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending").limit(1);
+    const hasMore = remaining && remaining.length > 0;
 
-    // Finalize batch
-    const finalStatus = errors.length === reports.length ? "failed" : "succeeded";
-    await supabase.from("ingestion_batches").update({
-      status: finalStatus,
-      completed_at: new Date().toISOString(),
-      reports_processed: processed,
-      claims_extracted: totalClaims,
-      error_message: errors.length ? errors.join("; ") : null,
-    }).eq("id", batch_id);
+    if (!hasMore) {
+      // All done — compute scores and finalize
+      await computeScores(batch_id);
+
+      const finalStatus = errors.length === reports.length ? "failed" : "succeeded";
+      await supabase.from("ingestion_batches").update({
+        status: finalStatus,
+        completed_at: new Date().toISOString(),
+        error_message: errors.length ? errors.join("; ") : null,
+      }).eq("id", batch_id);
+    }
 
     // Audit log
     await supabase.from("audit_logs").insert({
@@ -464,7 +490,7 @@ serve(async (req) => {
     });
 
     return new Response(
-      JSON.stringify({ success: true, processed, totalClaims, errors }),
+      JSON.stringify({ success: true, processed, totalClaims, errors, hasMore }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (e: any) {
