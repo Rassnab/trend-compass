@@ -1,6 +1,12 @@
 import { Settings } from "lucide-react";
+import YamlUpload from "@/components/admin/YamlUpload";
+import ReportUpload from "@/components/admin/ReportUpload";
+import IngestionStatus from "@/components/admin/IngestionStatus";
+import { useState } from "react";
 
 export default function AdminPage() {
+  const [refreshKey, setRefreshKey] = useState(0);
+
   return (
     <div className="container py-8">
       <div className="mb-8 flex items-center gap-3">
@@ -15,24 +21,15 @@ export default function AdminPage() {
         </div>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-3">
+      <div className="grid gap-6 lg:grid-cols-3">
         <div className="rounded-lg border bg-card p-6">
-          <h2 className="mb-2 font-semibold">YAML Taxonomy</h2>
-          <p className="text-sm text-muted-foreground">
-            Upload or update your master-metadata.yaml file
-          </p>
+          <YamlUpload />
         </div>
         <div className="rounded-lg border bg-card p-6">
-          <h2 className="mb-2 font-semibold">Report Upload</h2>
-          <p className="text-sm text-muted-foreground">
-            Upload PDF reports for processing
-          </p>
+          <ReportUpload onUploadComplete={() => setRefreshKey((k) => k + 1)} />
         </div>
         <div className="rounded-lg border bg-card p-6">
-          <h2 className="mb-2 font-semibold">Ingestion Status</h2>
-          <p className="text-sm text-muted-foreground">
-            Monitor and trigger the AI processing pipeline
-          </p>
+          <IngestionStatus key={refreshKey} />
         </div>
       </div>
     </div>
