@@ -46,27 +46,27 @@ async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
 // Simple PDF text extraction — reads raw stream and extracts text between BT/ET markers
 // For production, use a proper PDF library. This handles basic text-based PDFs.
 function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
-  const text = new TextDecoder("latin1").decode(bytes);
+  // Limit to ~10MB to avoid OOM
+  const MAX_PDF_BYTES = 10 * 1024 * 1024;
+  const slice = bytes.length > MAX_PDF_BYTES ? bytes.slice(0, MAX_PDF_BYTES) : bytes;
+  const text = new TextDecoder("latin1").decode(slice);
+  // Free the bytes reference early — caller should also null out
   const pages: string[] = [];
-  
-  // Split by page markers
+
+  // Count pages
   const pagePattern = /\/Type\s*\/Page[^s]/g;
   let pageCount = 0;
-  let match;
-  while ((match = pagePattern.exec(text)) !== null) {
-    pageCount++;
-  }
-  
-  // Extract all text content using stream markers
+  while (pagePattern.exec(text) !== null) pageCount++;
+
+  // Extract text from streams — collect into array to avoid huge string concat
+  const textParts: string[] = [];
   const streamRegex = /stream\r?\n([\s\S]*?)endstream/g;
-  let allText = "";
   let m;
   while ((m = streamRegex.exec(text)) !== null) {
     const content = m[1];
-    // Extract text between parentheses in BT/ET blocks
-    const textParts: string[] = [];
     const parenRegex = /\(([^)]*)\)/g;
     let pm;
+    const lineParts: string[] = [];
     while ((pm = parenRegex.exec(content)) !== null) {
       const decoded = pm[1]
         .replace(/\\n/g, "\n")
@@ -74,28 +74,31 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
         .replace(/\\t/g, "\t")
         .replace(/\\\\/g, "\\")
         .replace(/\\([()])/g, "$1");
-      if (decoded.trim()) textParts.push(decoded);
+      if (decoded.trim()) lineParts.push(decoded);
     }
-    if (textParts.length) allText += textParts.join(" ") + "\n";
+    if (lineParts.length) textParts.push(lineParts.join(" "));
   }
 
-  // If basic extraction failed, try to find any readable text
+  let allText = textParts.join("\n");
+
+  // Fallback if basic extraction failed
   if (!allText.trim()) {
-    const readable = text.replace(/[^\x20-\x7E\n\r\t]/g, " ")
+    allText = text.replace(/[^\x20-\x7E\n\r\t]/g, " ")
       .replace(/\s{3,}/g, "\n")
       .split("\n")
       .filter((line) => line.trim().length > 20 && !/^[%\/\[\]<>{}]/.test(line.trim()))
       .join("\n");
-    allText = readable;
   }
+
+  // Truncate to avoid downstream OOM (max ~200k chars)
+  if (allText.length > 200000) allText = allText.slice(0, 200000);
 
   // Split into approximate pages
   if (pageCount > 1) {
     const lines = allText.split("\n").filter((l) => l.trim());
     const linesPerPage = Math.max(1, Math.ceil(lines.length / pageCount));
     for (let i = 0; i < pageCount; i++) {
-      const pageLines = lines.slice(i * linesPerPage, (i + 1) * linesPerPage);
-      pages.push(pageLines.join("\n"));
+      pages.push(lines.slice(i * linesPerPage, (i + 1) * linesPerPage).join("\n"));
     }
   } else {
     pages.push(allText);
@@ -182,14 +185,16 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   const { data: fileData, error: dlError } = await supabase.storage.from("reports").download(report.file_path);
   if (dlError || !fileData) throw new Error(`Download failed: ${dlError?.message}`);
 
-  const pdfBytes = new Uint8Array(await fileData.arrayBuffer());
+  let pdfBytes: Uint8Array | null = new Uint8Array(await fileData.arrayBuffer());
 
   // 2. Extract text
   const pages = extractTextFromPdfBytes(pdfBytes);
+  pdfBytes = null; // Free PDF bytes from memory
   await supabase.from("reports").update({ page_count: pages.length }).eq("id", reportId);
 
   // 3. Chunk
   const rawChunks = chunkText(pages);
+  pages.length = 0; // Free pages array
   if (!rawChunks.length) throw new Error("No text extracted from PDF");
 
   // 4. Embed in batch & store chunks
