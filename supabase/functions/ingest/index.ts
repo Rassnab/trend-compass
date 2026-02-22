@@ -323,7 +323,10 @@ Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Report text:
 ${truncatedText}`;
 
-  const claimResponse = await withRetry(() => llmChat([{ role: "user", content: claimPrompt }], 0.1, 8000));
+  const claimResponse = await withRetry(() => llmChat([
+    { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+    { role: "user", content: claimPrompt },
+  ], 0.1, 8000));
 
   let claims: any[];
   try {
@@ -388,7 +391,10 @@ For each claim, return a JSON array of objects with:
 
 Return ONLY a valid JSON array.`;
 
-      const mappingResponse = await withRetry(() => llmChat([{ role: "user", content: mappingPrompt }], 0.1, 4000));
+      const mappingResponse = await withRetry(() => llmChat([
+        { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+        { role: "user", content: mappingPrompt },
+      ], 0.1, 4000));
       try {
         const mappings = robustJsonParse(mappingResponse);
         const validThemeIds = new Set(themes.map((t: any) => t.theme_id));
@@ -444,7 +450,10 @@ Return a JSON array of objects (only for claims that clearly relate to a tension
 
 Return ONLY a valid JSON array. If no claims match, return [].`;
 
-      const tensionResponse = await withRetry(() => llmChat([{ role: "user", content: tensionPrompt }], 0.1, 3000));
+      const tensionResponse = await withRetry(() => llmChat([
+        { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+        { role: "user", content: tensionPrompt },
+      ], 0.1, 3000));
       try {
         const tensionMappings = robustJsonParse(tensionResponse);
         const validTensionIds = new Set(tensions.map((t: any) => t.tension_id));
@@ -617,7 +626,14 @@ serve(async (req) => {
     if (!hasMore) {
       await computeScores(batch_id);
 
-      const failureRate = reports.length > 0 ? errors.length / reports.length : 0;
+      // Use batch-level totals from DB, not just this invocation's local errors
+      const { data: batchReports } = await supabase
+        .from("reports")
+        .select("status")
+        .eq("batch_id", batch_id);
+      const totalInBatch = batchReports?.length || 0;
+      const failedInBatch = batchReports?.filter((r: any) => r.status === "failed").length || 0;
+      const failureRate = totalInBatch > 0 ? failedInBatch / totalInBatch : 0;
       const finalStatus = failureRate > 0.5 ? "failed" : "succeeded";
       await supabase.from("ingestion_batches").update({
         status: finalStatus,
