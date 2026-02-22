@@ -7,29 +7,32 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
+const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+const AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
+
 // ─── Helpers ───────────────────────────────────────────────
 
-async function openaiChat(messages: any[], temperature = 0.2, maxTokens = 4000) {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+async function llmChat(messages: any[], temperature = 0.2, maxTokens = 4000) {
+  const res = await fetch(AI_GATEWAY, {
     method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o-mini", messages, temperature, max_tokens: maxTokens }),
+    headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "google/gemini-2.5-flash", messages, temperature, max_tokens: maxTokens }),
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`OpenAI error ${res.status}: ${t}`);
+    throw new Error(`LLM error ${res.status}: ${t}`);
   }
   const data = await res.json();
   return data.choices[0].message.content;
 }
 
 async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
+  const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
   const res = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -43,22 +46,17 @@ async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
   return data.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
 }
 
-// Simple PDF text extraction — reads raw stream and extracts text between BT/ET markers
-// For production, use a proper PDF library. This handles basic text-based PDFs.
+// Simple PDF text extraction
 function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
-  // Limit to ~10MB to avoid OOM
   const MAX_PDF_BYTES = 10 * 1024 * 1024;
   const slice = bytes.length > MAX_PDF_BYTES ? bytes.slice(0, MAX_PDF_BYTES) : bytes;
   const text = new TextDecoder("latin1").decode(slice);
-  // Free the bytes reference early — caller should also null out
   const pages: string[] = [];
 
-  // Count pages
   const pagePattern = /\/Type\s*\/Page[^s]/g;
   let pageCount = 0;
   while (pagePattern.exec(text) !== null) pageCount++;
 
-  // Extract text from streams — collect into array to avoid huge string concat
   const textParts: string[] = [];
   const streamRegex = /stream\r?\n([\s\S]*?)endstream/g;
   let m;
@@ -81,7 +79,6 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
 
   let allText = textParts.join("\n");
 
-  // Fallback if basic extraction failed
   if (!allText.trim()) {
     allText = text.replace(/[^\x20-\x7E\n\r\t]/g, " ")
       .replace(/\s{3,}/g, "\n")
@@ -90,10 +87,8 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
       .join("\n");
   }
 
-  // Truncate to avoid downstream OOM (max ~200k chars)
   if (allText.length > 200000) allText = allText.slice(0, 200000);
 
-  // Split into approximate pages
   if (pageCount > 1) {
     const lines = allText.split("\n").filter((l) => l.trim());
     const linesPerPage = Math.max(1, Math.ceil(lines.length / pageCount));
@@ -107,14 +102,10 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
   return pages.length ? pages : ["[No extractable text found in PDF]"];
 }
 
-// Sanitize text to remove problematic Unicode escape sequences that PostgreSQL rejects
 function sanitizeText(text: string): string {
-  // Remove null bytes and other control characters
   let cleaned = text.replace(/\x00/g, "");
-  // Remove invalid Unicode surrogate pairs and escape sequences
   cleaned = cleaned.replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, "");
   cleaned = cleaned.replace(/\\u[dD][89abAB][0-9a-fA-F]{2}/g, "");
-  // Remove any remaining non-printable characters except newlines/tabs
   cleaned = cleaned.replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   return cleaned;
 }
@@ -147,14 +138,12 @@ function chunkText(pages: string[], targetTokens = 400): { text: string; pageSta
     chunks.push({ text: current, pageStart: currentStart, pageEnd: pages.length });
   }
 
-  // Hard-split any chunk that's still too large (>6000 chars ≈ 1500 tokens)
   const MAX_CHARS = 6000;
   const safechunks: typeof chunks = [];
   for (const c of chunks) {
     if (c.text.length <= MAX_CHARS) {
       safechunks.push(c);
     } else {
-      // Split by sentences
       const sentences = c.text.match(/[^.!?]+[.!?]+/g) || [c.text];
       let buf = "";
       for (const s of sentences) {
@@ -175,7 +164,6 @@ function chunkText(pages: string[], targetTokens = 400): { text: string; pageSta
 // ─── Main Pipeline ─────────────────────────────────────────
 
 async function processReport(reportId: string, batchId: string, themes: any[], tensions: any[]) {
-  // Update status
   await supabase.from("reports").update({ status: "processing" }).eq("id", reportId);
 
   const { data: report } = await supabase.from("reports").select("*").eq("id", reportId).single();
@@ -189,19 +177,18 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
 
   // 2. Extract text
   const pages = extractTextFromPdfBytes(pdfBytes);
-  pdfBytes = null; // Free PDF bytes from memory
+  pdfBytes = null;
   await supabase.from("reports").update({ page_count: pages.length }).eq("id", reportId);
 
   // 3. Chunk
   const rawChunks = chunkText(pages);
-  pages.length = 0; // Free pages array
+  pages.length = 0;
   if (!rawChunks.length) throw new Error("No text extracted from PDF");
 
-  // 4. Embed in batch & store chunks
+  // 4. Embed in batch & store chunks (BATCH INSERT)
   const textsForEmbedding = rawChunks.map(c => sanitizeText(c.text).slice(0, 6000));
   
-  // Batch embed in groups of 20 to stay within API limits
-  const EMBED_BATCH = 20;
+  const EMBED_BATCH = 50; // Increased from 20
   const allEmbeddings: number[][] = [];
   for (let i = 0; i < textsForEmbedding.length; i += EMBED_BATCH) {
     const batch = textsForEmbedding.slice(i, i + EMBED_BATCH);
@@ -209,28 +196,25 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
     allEmbeddings.push(...embeddings);
   }
 
-  const chunkIds: string[] = [];
-  for (let i = 0; i < rawChunks.length; i++) {
-    const safeText = textsForEmbedding[i];
-    const { data: inserted, error } = await supabase
-      .from("chunks")
-      .insert({
-        report_id: reportId,
-        text: safeText,
-        page_start: rawChunks[i].pageStart,
-        page_end: rawChunks[i].pageEnd,
-        embedding: JSON.stringify(allEmbeddings[i]),
-        token_count: safeText.split(/\s+/).length,
-      })
-      .select("id")
-      .single();
-    if (error) throw new Error(`Chunk insert: ${error.message}`);
-    chunkIds.push(inserted.id);
+  // Batch insert all chunks at once
+  const chunkRows = rawChunks.map((c, i) => ({
+    report_id: reportId,
+    text: textsForEmbedding[i],
+    page_start: c.pageStart,
+    page_end: c.pageEnd,
+    embedding: JSON.stringify(allEmbeddings[i]),
+    token_count: textsForEmbedding[i].split(/\s+/).length,
+  }));
+
+  const DB_BATCH = 50;
+  for (let i = 0; i < chunkRows.length; i += DB_BATCH) {
+    const { error } = await supabase.from("chunks").insert(chunkRows.slice(i, i + DB_BATCH));
+    if (error) throw new Error(`Chunk batch insert: ${error.message}`);
   }
 
   // 5. Extract claims via LLM
   const allText = rawChunks.map((c) => `[Pages ${c.pageStart}-${c.pageEnd}]\n${c.text}`).join("\n\n---\n\n");
-  const truncatedText = allText.slice(0, 30000); // Stay within context limits
+  const truncatedText = allText.slice(0, 30000);
 
   const claimPrompt = `You are analyzing a hotel industry trend report. Extract 12-30 key claims from this report.
 
@@ -247,11 +231,7 @@ Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Report text:
 ${truncatedText}`;
 
-  const claimResponse = await openaiChat(
-    [{ role: "user", content: claimPrompt }],
-    0.1,
-    4000
-  );
+  const claimResponse = await llmChat([{ role: "user", content: claimPrompt }], 0.1, 4000);
 
   let claims: any[];
   try {
@@ -261,36 +241,37 @@ ${truncatedText}`;
     throw new Error("Failed to parse claims JSON from LLM");
   }
 
-  // 6. Store claims
-  const claimRecords: { id: string; claim_text: string }[] = [];
-  for (const claim of claims) {
-    const { data, error } = await supabase
-      .from("claims")
-      .insert({
-        report_id: reportId,
-        batch_id: batchId,
-        claim_text: sanitizeText(claim.claim_text || ""),
-        evidence_snippet: claim.evidence_snippet ? sanitizeText(claim.evidence_snippet) : null,
-        page_number: claim.page_number || null,
-        confidence: claim.confidence || 0.5,
-        scope_geo: claim.scope_geo || null,
-        scope_segment: claim.scope_segment || null,
-      })
-      .select("id, claim_text")
-      .single();
-    if (error) throw new Error(`Claim insert: ${error.message}`);
-    claimRecords.push(data);
-  }
+  // 6. Batch insert all claims
+  const claimInsertRows = claims.map(claim => ({
+    report_id: reportId,
+    batch_id: batchId,
+    claim_text: sanitizeText(claim.claim_text || ""),
+    evidence_snippet: claim.evidence_snippet ? sanitizeText(claim.evidence_snippet) : null,
+    page_number: claim.page_number || null,
+    confidence: claim.confidence || 0.5,
+    scope_geo: claim.scope_geo || null,
+    scope_segment: claim.scope_segment || null,
+  }));
 
-  // 7. Theme mapping
+  const { data: insertedClaims, error: claimErr } = await supabase
+    .from("claims")
+    .insert(claimInsertRows)
+    .select("id, claim_text");
+  if (claimErr) throw new Error(`Claims batch insert: ${claimErr.message}`);
+
+  const claimRecords = insertedClaims || [];
+
+  // 7 & 8. Theme mapping + Tension mapping IN PARALLEL
+  const mappingPromises: Promise<void>[] = [];
+
   if (themes.length > 0 && claimRecords.length > 0) {
-    const themeList = themes
-      .map((t: any) => `- ${t.theme_id}: ${t.label} — ${t.definition || "No definition"}`)
-      .join("\n");
+    mappingPromises.push((async () => {
+      const themeList = themes
+        .map((t: any) => `- ${t.theme_id}: ${t.label} — ${t.definition || "No definition"}`)
+        .join("\n");
+      const claimTexts = claimRecords.map((c, i) => `${i + 1}. ${c.claim_text}`).join("\n");
 
-    const claimTexts = claimRecords.map((c, i) => `${i + 1}. ${c.claim_text}`).join("\n");
-
-    const mappingPrompt = `Map each claim to the most relevant theme. Available themes:
+      const mappingPrompt = `Map each claim to the most relevant theme. Available themes:
 ${themeList}
 
 Claims:
@@ -305,39 +286,42 @@ For each claim, return a JSON array of objects with:
 
 Return ONLY a valid JSON array.`;
 
-    const mappingResponse = await openaiChat([{ role: "user", content: mappingPrompt }], 0.1, 4000);
+      const mappingResponse = await llmChat([{ role: "user", content: mappingPrompt }], 0.1, 4000);
+      try {
+        const cleaned = mappingResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        const mappings = JSON.parse(cleaned);
 
-    try {
-      const cleaned = mappingResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      const mappings = JSON.parse(cleaned);
-
-      for (const m of mappings) {
-        const idx = (m.claim_index || 1) - 1;
-        if (idx >= 0 && idx < claimRecords.length) {
-          await supabase.from("claim_theme_map").insert({
-            claim_id: claimRecords[idx].id,
+        const rows = mappings
+          .filter((m: any) => {
+            const idx = (m.claim_index || 1) - 1;
+            return idx >= 0 && idx < claimRecords.length;
+          })
+          .map((m: any) => ({
+            claim_id: claimRecords[(m.claim_index || 1) - 1].id,
             theme_id: m.theme_id,
             stance: m.stance || "neutral",
             confidence: m.confidence || 0.5,
             rationale: m.rationale || null,
             is_primary: true,
-          });
+          }));
+
+        if (rows.length) {
+          await supabase.from("claim_theme_map").insert(rows);
         }
+      } catch {
+        console.error("Failed to parse theme mappings");
       }
-    } catch {
-      console.error("Failed to parse theme mappings");
-    }
+    })());
   }
 
-  // 8. Tension mapping
   if (tensions.length > 0 && claimRecords.length > 0) {
-    const tensionList = tensions
-      .map((t: any) => `- ${t.tension_id}: "${t.pole_a_label}" vs "${t.pole_b_label}" (${t.label})`)
-      .join("\n");
+    mappingPromises.push((async () => {
+      const tensionList = tensions
+        .map((t: any) => `- ${t.tension_id}: "${t.pole_a_label}" vs "${t.pole_b_label}" (${t.label})`)
+        .join("\n");
+      const claimTexts = claimRecords.map((c, i) => `${i + 1}. ${c.claim_text}`).join("\n");
 
-    const claimTexts = claimRecords.map((c, i) => `${i + 1}. ${c.claim_text}`).join("\n");
-
-    const tensionPrompt = `Analyze which claims relate to these tensions and which pole they support:
+      const tensionPrompt = `Analyze which claims relate to these tensions and which pole they support:
 
 Tensions:
 ${tensionList}
@@ -353,32 +337,38 @@ Return a JSON array of objects (only for claims that clearly relate to a tension
 
 Return ONLY a valid JSON array. If no claims match, return [].`;
 
-    const tensionResponse = await openaiChat([{ role: "user", content: tensionPrompt }], 0.1, 3000);
+      const tensionResponse = await llmChat([{ role: "user", content: tensionPrompt }], 0.1, 3000);
+      try {
+        const cleaned = tensionResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        const tensionMappings = JSON.parse(cleaned);
 
-    try {
-      const cleaned = tensionResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      const tensionMappings = JSON.parse(cleaned);
-
-      for (const tm of tensionMappings) {
-        const idx = (tm.claim_index || 1) - 1;
-        if (idx >= 0 && idx < claimRecords.length) {
-          await supabase.from("tension_evidence").insert({
+        const rows = tensionMappings
+          .filter((tm: any) => {
+            const idx = (tm.claim_index || 1) - 1;
+            return idx >= 0 && idx < claimRecords.length;
+          })
+          .map((tm: any) => ({
             tension_id: tm.tension_id,
-            claim_id: claimRecords[idx].id,
+            claim_id: claimRecords[(tm.claim_index || 1) - 1].id,
             pole: tm.pole || "A",
             confidence: tm.confidence || 0.5,
-          });
+          }));
+
+        if (rows.length) {
+          await supabase.from("tension_evidence").insert(rows);
         }
+      } catch {
+        console.error("Failed to parse tension mappings");
       }
-    } catch {
-      console.error("Failed to parse tension mappings");
-    }
+    })());
   }
+
+  await Promise.all(mappingPromises);
 
   // Mark report as succeeded
   await supabase.from("reports").update({ status: "succeeded" }).eq("id", reportId);
 
-  return { chunksCreated: chunkIds.length, claimsExtracted: claimRecords.length };
+  return { chunksCreated: chunkRows.length, claimsExtracted: claimRecords.length };
 }
 
 // ─── Scoring ───────────────────────────────────────────────
@@ -401,20 +391,23 @@ async function computeScores(batchId: string) {
       byTheme[tid].stances.push(m.stance);
     }
 
-    for (const [themeId, data] of Object.entries(byTheme)) {
+    const themeScoreRows = Object.entries(byTheme).map(([themeId, data]) => {
       const coverage = data.reports.size;
       const avgConf = data.confidences.reduce((a, b) => a + b, 0) / data.confidences.length;
       const supportRatio = data.stances.filter((s) => s === "supports").length / data.stances.length;
       const supportScore = Math.round(100 * (0.4 * Math.min(coverage / 5, 1) + 0.4 * avgConf + 0.2 * supportRatio));
-
-      await supabase.from("theme_scores").insert({
+      return {
         theme_id: themeId,
         batch_id: batchId,
         coverage_count: coverage,
         support_score: supportScore,
         evidence_strength: Math.round(avgConf * 100) / 100,
         diversity_score: Math.round((coverage / Math.max(1, data.reports.size)) * 100) / 100,
-      });
+      };
+    });
+
+    if (themeScoreRows.length) {
+      await supabase.from("theme_scores").insert(themeScoreRows);
     }
   }
 
@@ -435,13 +428,12 @@ async function computeScores(batchId: string) {
       byTension[tid].confidences.push(Number(te.confidence) || 0);
     }
 
-    for (const [tensionId, data] of Object.entries(byTension)) {
+    const tensionScoreRows = Object.entries(byTension).map(([tensionId, data]) => {
       const total = data.aCount + data.bCount;
       const balance = 1 - Math.abs(data.aCount - data.bCount) / total;
       const avgConf = data.confidences.reduce((a, b) => a + b, 0) / data.confidences.length;
       const strengthScore = Math.round(100 * (0.5 * avgConf + 0.5 * balance));
-
-      await supabase.from("tension_scores").insert({
+      return {
         tension_id: tensionId,
         batch_id: batchId,
         polarization: Math.round(avgConf * 100) / 100,
@@ -449,7 +441,11 @@ async function computeScores(batchId: string) {
         strength_score: strengthScore,
         pole_a_count: data.aCount,
         pole_b_count: data.bCount,
-      });
+      };
+    });
+
+    if (tensionScoreRows.length) {
+      await supabase.from("tension_scores").insert(tensionScoreRows);
     }
   }
 }
@@ -463,15 +459,14 @@ serve(async (req) => {
     const { batch_id } = await req.json();
     if (!batch_id) throw new Error("batch_id is required");
 
-    // Get batch
     await supabase.from("ingestion_batches").update({ status: "running", started_at: new Date().toISOString() }).eq("id", batch_id);
 
-    // Get reports in batch — limit to 3 per invocation to avoid memory limits
-    const MAX_PER_INVOCATION = 1;
+    // Process 3 reports per invocation
+    const MAX_PER_INVOCATION = 3;
     const { data: reports } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending").limit(MAX_PER_INVOCATION);
     if (!reports || reports.length === 0) throw new Error("No pending reports in batch");
 
-    // Get taxonomy
+    // Get taxonomy once
     const { data: themes } = await supabase.from("taxonomy_themes").select("theme_id, label, definition, boundaries, cues");
     const { data: tensions } = await supabase.from("taxonomy_tensions").select("tension_id, label, pole_a_label, pole_a_cues, pole_b_label, pole_b_cues");
 
@@ -497,7 +492,6 @@ serve(async (req) => {
     const hasMore = remaining && remaining.length > 0;
 
     if (!hasMore) {
-      // All done — compute scores and finalize
       await computeScores(batch_id);
 
       const finalStatus = errors.length === reports.length ? "failed" : "succeeded";
@@ -508,12 +502,11 @@ serve(async (req) => {
       }).eq("id", batch_id);
     }
 
-    // Audit log
     await supabase.from("audit_logs").insert({
       batch_id,
       action: "ingestion_complete",
-      model_provider: "openai",
-      model_name: "gpt-4o-mini / text-embedding-3-small",
+      model_provider: "lovable-ai-gateway",
+      model_name: "gemini-2.5-flash / text-embedding-3-small",
       details: { reports_processed: processed, claims_extracted: totalClaims, errors },
     });
 
