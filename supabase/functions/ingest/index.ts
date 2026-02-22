@@ -104,6 +104,18 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
   return pages.length ? pages : ["[No extractable text found in PDF]"];
 }
 
+// Sanitize text to remove problematic Unicode escape sequences that PostgreSQL rejects
+function sanitizeText(text: string): string {
+  // Remove null bytes and other control characters
+  let cleaned = text.replace(/\x00/g, "");
+  // Remove invalid Unicode surrogate pairs and escape sequences
+  cleaned = cleaned.replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, "");
+  cleaned = cleaned.replace(/\\u[dD][89abAB][0-9a-fA-F]{2}/g, "");
+  // Remove any remaining non-printable characters except newlines/tabs
+  cleaned = cleaned.replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  return cleaned;
+}
+
 function chunkText(pages: string[], targetTokens = 400): { text: string; pageStart: number; pageEnd: number }[] {
   const chunks: { text: string; pageStart: number; pageEnd: number }[] = [];
   let current = "";
