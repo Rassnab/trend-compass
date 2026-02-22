@@ -80,10 +80,23 @@ export default function IngestionStatus() {
 
       if (updateErr) throw updateErr;
 
-      toast.success(`Batch created with ${pendingReports.length} reports. Ingestion pipeline will process them when edge functions are deployed.`);
+      toast.info(`Batch created. Starting ingestion of ${pendingReports.length} reports...`);
+      await fetchData();
+
+      // Call the ingestion edge function
+      const { data: fnData, error: fnError } = await supabase.functions.invoke("ingest", {
+        body: { batch_id: batch.id },
+      });
+
+      if (fnError) throw fnError;
+
+      if (fnData?.error) throw new Error(fnData.error);
+
+      toast.success(`Ingestion complete: ${fnData.processed} reports, ${fnData.totalClaims} claims extracted`);
       await fetchData();
     } catch (err: any) {
-      toast.error(err.message || "Failed to trigger ingestion");
+      toast.error(err.message || "Failed to run ingestion");
+      await fetchData();
     }
     setTriggering(false);
   };
