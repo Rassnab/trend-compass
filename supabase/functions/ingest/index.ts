@@ -97,9 +97,16 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
   let m;
   while ((m = streamRegex.exec(text)) !== null) {
     const content = m[1];
-    const parenRegex = /\(([^)]*)\)/g;
-    let pm;
+
+    // Skip compressed/binary streams — they produce garbage when regex-matched
+    const streamPrintable = (content.match(/[\x20-\x7E]/g) || []).length;
+    if (streamPrintable / Math.max(content.length, 1) < 0.3) continue;
+
     const lineParts: string[] = [];
+
+    // Extract parenthesized strings: (Hello World)
+    const parenRegex = /\(([^)]{0,500})\)/g;
+    let pm;
     while ((pm = parenRegex.exec(content)) !== null) {
       const decoded = pm[1]
         .replace(/\\n/g, "\n")
@@ -109,6 +116,29 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
         .replace(/\\([()])/g, "$1");
       if (decoded.trim()) lineParts.push(decoded);
     }
+
+    // Extract hex strings: <0054006F> (UTF-16BE or single-byte encoding)
+    const hexRegex = /<([0-9a-fA-F]{4,})>/g;
+    let hm;
+    while ((hm = hexRegex.exec(content)) !== null) {
+      const hexStr = hm[1];
+      let decoded = "";
+      if (hexStr.length % 4 === 0) {
+        // Try UTF-16BE (common for CIDFont / Type0 fonts)
+        for (let i = 0; i < hexStr.length; i += 4) {
+          const code = parseInt(hexStr.slice(i, i + 4), 16);
+          if (code > 31 && code < 65536) decoded += String.fromCharCode(code);
+        }
+      } else if (hexStr.length % 2 === 0) {
+        // Single-byte encoding
+        for (let i = 0; i < hexStr.length; i += 2) {
+          const code = parseInt(hexStr.slice(i, i + 2), 16);
+          if (code > 31 && code < 128) decoded += String.fromCharCode(code);
+        }
+      }
+      if (decoded.trim().length > 2) lineParts.push(decoded);
+    }
+
     if (lineParts.length) textParts.push(lineParts.join(" "));
   }
 
@@ -246,7 +276,7 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   const printableChars = (combinedText.match(/[\x20-\x7E]/g) || []).length;
   const printableRatio = combinedText.length > 0 ? printableChars / combinedText.length : 0;
   const isPlaceholder = combinedText.trim() === "[No extractable text found in PDF]";
-  if (isPlaceholder || printableRatio < 0.5 || combinedText.trim().length < 100) {
+  if (isPlaceholder || printableRatio < 0.25 || combinedText.trim().length < 100) {
     throw new Error(
       `PDF text extraction failed (printable ratio: ${(printableRatio * 100).toFixed(0)}%). ` +
       `The file may be scanned, encrypted, or use an unsupported encoding.`
