@@ -102,6 +102,30 @@ function extractTextFromPdfBytes(bytes: Uint8Array): string[] {
   return pages.length ? pages : ["[No extractable text found in PDF]"];
 }
 
+function robustJsonParse(text: string): any {
+  // Strip markdown fences
+  let cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+  // Try direct parse
+  try { return JSON.parse(cleaned); } catch {}
+  // Try to find JSON array in the text
+  const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+  if (arrMatch) {
+    try { return JSON.parse(arrMatch[0]); } catch {}
+    // If array is truncated, try to fix by closing it
+    const truncated = arrMatch[0].replace(/,\s*$/, "") + "]";
+    try { return JSON.parse(truncated); } catch {}
+    // Try removing the last incomplete object
+    const lastComplete = truncated.replace(/,?\s*\{[^}]*$/, "") + "]";
+    try { return JSON.parse(lastComplete); } catch {}
+  }
+  // Try to find JSON object
+  const objMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (objMatch) {
+    try { return JSON.parse(`[${objMatch[0]}]`); } catch {}
+  }
+  throw new Error("No valid JSON found");
+}
+
 function sanitizeText(text: string): string {
   let cleaned = text.replace(/\x00/g, "");
   cleaned = cleaned.replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, "");
@@ -231,14 +255,24 @@ Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Report text:
 ${truncatedText}`;
 
-  const claimResponse = await llmChat([{ role: "user", content: claimPrompt }], 0.1, 4000);
+  const claimResponse = await llmChat([{ role: "user", content: claimPrompt }], 0.1, 8000);
 
   let claims: any[];
   try {
-    const cleaned = claimResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    claims = JSON.parse(cleaned);
-  } catch {
-    throw new Error("Failed to parse claims JSON from LLM");
+    // Sanitize the LLM response to remove binary characters before parsing
+    const sanitizedResponse = claimResponse.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "");
+    claims = robustJsonParse(sanitizedResponse);
+    if (!Array.isArray(claims) || claims.length === 0) {
+      throw new Error("Empty or non-array result");
+    }
+    // Filter out claims about garbled/unreadable text
+    claims = claims.filter((c: any) => c.claim_text && !c.claim_text.toLowerCase().includes("garbled") && !c.claim_text.toLowerCase().includes("unreadable"));
+    if (claims.length === 0) {
+      throw new Error("PDF text is unreadable - no meaningful claims extracted");
+    }
+  } catch (parseErr: any) {
+    console.error(`Claims parse failed for report ${reportId}. LLM response (first 500 chars):`, claimResponse?.slice(0, 500));
+    throw new Error(`Failed to parse claims JSON from LLM: ${parseErr.message}`);
   }
 
   // 6. Batch insert all claims
@@ -288,8 +322,7 @@ Return ONLY a valid JSON array.`;
 
       const mappingResponse = await llmChat([{ role: "user", content: mappingPrompt }], 0.1, 4000);
       try {
-        const cleaned = mappingResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        const mappings = JSON.parse(cleaned);
+        const mappings = robustJsonParse(mappingResponse);
 
         const rows = mappings
           .filter((m: any) => {
@@ -339,8 +372,7 @@ Return ONLY a valid JSON array. If no claims match, return [].`;
 
       const tensionResponse = await llmChat([{ role: "user", content: tensionPrompt }], 0.1, 3000);
       try {
-        const cleaned = tensionResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        const tensionMappings = JSON.parse(cleaned);
+        const tensionMappings = robustJsonParse(tensionResponse);
 
         const rows = tensionMappings
           .filter((tm: any) => {
@@ -470,8 +502,10 @@ serve(async (req) => {
     const { data: themes } = await supabase.from("taxonomy_themes").select("theme_id, label, definition, boundaries, cues");
     const { data: tensions } = await supabase.from("taxonomy_tensions").select("tension_id, label, pole_a_label, pole_a_cues, pole_b_label, pole_b_cues");
 
-    let totalClaims = 0;
-    let processed = 0;
+    // Get current cumulative counts from batch
+    const { data: currentBatch } = await supabase.from("ingestion_batches").select("reports_processed, claims_extracted").eq("id", batch_id).single();
+    let totalClaims = currentBatch?.claims_extracted || 0;
+    let processed = currentBatch?.reports_processed || 0;
     const errors: string[] = [];
 
     for (const report of reports) {
