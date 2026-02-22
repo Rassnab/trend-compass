@@ -29,18 +29,18 @@ async function openaiChat(messages: any[], temperature = 0.2, maxTokens = 4000) 
   return data.choices[0].message.content;
 }
 
-async function openaiEmbedding(text: string): Promise<number[]> {
+async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
   const res = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
+    body: JSON.stringify({ model: "text-embedding-3-small", input: texts }),
   });
   if (!res.ok) {
     const t = await res.text();
     throw new Error(`Embedding error ${res.status}: ${t}`);
   }
   const data = await res.json();
-  return data.data[0].embedding;
+  return data.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
 }
 
 // Simple PDF text extraction — reads raw stream and extracts text between BT/ET markers
@@ -192,19 +192,30 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   const rawChunks = chunkText(pages);
   if (!rawChunks.length) throw new Error("No text extracted from PDF");
 
-  // 4. Embed & store chunks
+  // 4. Embed in batch & store chunks
+  const textsForEmbedding = rawChunks.map(c => sanitizeText(c.text).slice(0, 6000));
+  
+  // Batch embed in groups of 20 to stay within API limits
+  const EMBED_BATCH = 20;
+  const allEmbeddings: number[][] = [];
+  for (let i = 0; i < textsForEmbedding.length; i += EMBED_BATCH) {
+    const batch = textsForEmbedding.slice(i, i + EMBED_BATCH);
+    const embeddings = await openaiEmbeddingBatch(batch);
+    allEmbeddings.push(...embeddings);
+  }
+
   const chunkIds: string[] = [];
-  for (const chunk of rawChunks) {
-    const embedding = await openaiEmbedding(chunk.text.slice(0, 6000));
+  for (let i = 0; i < rawChunks.length; i++) {
+    const safeText = textsForEmbedding[i];
     const { data: inserted, error } = await supabase
       .from("chunks")
       .insert({
         report_id: reportId,
-        text: chunk.text,
-        page_start: chunk.pageStart,
-        page_end: chunk.pageEnd,
-        embedding: JSON.stringify(embedding),
-        token_count: chunk.text.split(/\s+/).length,
+        text: safeText,
+        page_start: rawChunks[i].pageStart,
+        page_end: rawChunks[i].pageEnd,
+        embedding: JSON.stringify(allEmbeddings[i]),
+        token_count: safeText.split(/\s+/).length,
       })
       .select("id")
       .single();
@@ -253,8 +264,8 @@ ${truncatedText}`;
       .insert({
         report_id: reportId,
         batch_id: batchId,
-        claim_text: claim.claim_text || "",
-        evidence_snippet: claim.evidence_snippet || null,
+        claim_text: sanitizeText(claim.claim_text || ""),
+        evidence_snippet: claim.evidence_snippet ? sanitizeText(claim.evidence_snippet) : null,
         page_number: claim.page_number || null,
         confidence: claim.confidence || 0.5,
         scope_geo: claim.scope_geo || null,
@@ -451,7 +462,7 @@ serve(async (req) => {
     await supabase.from("ingestion_batches").update({ status: "running", started_at: new Date().toISOString() }).eq("id", batch_id);
 
     // Get reports in batch — limit to 3 per invocation to avoid memory limits
-    const MAX_PER_INVOCATION = 3;
+    const MAX_PER_INVOCATION = 1;
     const { data: reports } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending").limit(MAX_PER_INVOCATION);
     if (!reports || reports.length === 0) throw new Error("No pending reports in batch");
 
