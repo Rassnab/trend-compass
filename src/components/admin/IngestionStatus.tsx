@@ -87,21 +87,30 @@ export default function IngestionStatus() {
       let totalProcessed = 0;
       let totalClaims = 0;
       let hasMore = true;
+      let consecutiveErrors = 0;
 
       while (hasMore) {
-        const { data: fnData, error: fnError } = await supabase.functions.invoke("ingest", {
-          body: { batch_id: batch.id },
-        });
+        try {
+          const { data: fnData, error: fnError } = await supabase.functions.invoke("ingest", {
+            body: { batch_id: batch.id },
+          });
 
-        if (fnError) throw fnError;
-        if (fnData?.error) throw new Error(fnData.error);
+          if (fnError) throw fnError;
+          if (fnData?.error) throw new Error(fnData.error);
 
-        totalProcessed += fnData.processed || 0;
-        totalClaims += fnData.totalClaims || 0;
-        hasMore = fnData.hasMore || false;
+          consecutiveErrors = 0;
+          totalProcessed += fnData.processed || 0;
+          totalClaims += fnData.totalClaims || 0;
+          hasMore = fnData.hasMore || false;
 
-        toast.info(`Processed ${totalProcessed}/${pendingReports.length} reports so far...`);
-        await fetchData();
+          toast.info(`Processed ${totalProcessed}/${pendingReports.length} reports so far...`);
+          await fetchData();
+          if (hasMore) await new Promise((r) => setTimeout(r, 1000));
+        } catch (err: any) {
+          consecutiveErrors++;
+          if (consecutiveErrors >= 3) throw err;
+          await new Promise((r) => setTimeout(r, 2000 * consecutiveErrors));
+        }
       }
 
       toast.success(`Ingestion complete: ${totalProcessed} reports, ${totalClaims} claims extracted`);

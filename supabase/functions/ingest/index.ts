@@ -7,43 +7,78 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY")!;
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions";
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 // ─── Helpers ───────────────────────────────────────────────
 
 async function llmChat(messages: any[], temperature = 0.2, maxTokens = 4000) {
-  const res = await fetch(AI_GATEWAY, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "google/gemini-2.5-flash", messages, temperature, max_tokens: maxTokens }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`LLM error ${res.status}: ${t}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const res = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages, temperature, max_tokens: maxTokens }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`LLM error ${res.status}: ${t}`);
+    }
+    const data = await res.json();
+    return data.choices[0].message.content;
+  } finally {
+    clearTimeout(timer);
   }
-  const data = await res.json();
-  return data.choices[0].message.content;
 }
 
 async function openaiEmbeddingBatch(texts: string[]): Promise<number[][]> {
-  const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
-  const res = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: texts }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Embedding error ${res.status}: ${t}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  try {
+    const res = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: texts }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`Embedding error ${res.status}: ${t}`);
+    }
+    const data = await res.json();
+    return data.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
+  } finally {
+    clearTimeout(timer);
   }
-  const data = await res.json();
-  return data.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3, baseDelayMs = 1000): Promise<T> {
+  let lastErr: Error = new Error("Unknown error");
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const isTransient =
+        err.message?.includes("429") ||
+        err.message?.includes("500") ||
+        err.message?.includes("503") ||
+        err.message?.includes("network") ||
+        err.message?.includes("timeout") ||
+        err.name === "AbortError";
+      if (!isTransient || attempt === maxAttempts) throw err;
+      console.warn(`Attempt ${attempt} failed (${err.message}), retrying in ${baseDelayMs * 2 ** (attempt - 1)}ms...`);
+      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** (attempt - 1)));
+    }
+  }
+  throw lastErr;
 }
 
 // Simple PDF text extraction
@@ -151,7 +186,10 @@ function chunkText(pages: string[], targetTokens = 400): { text: string; pageSta
 
     if (approxTokens > targetTokens && current) {
       chunks.push({ text: current, pageStart: currentStart, pageEnd: pageNum - 1 });
-      current = pageText;
+      // Carry last ~100 words into next chunk for retrieval context continuity
+      const prevWords = current.split(/\s+/);
+      const overlap = prevWords.slice(-100).join(" ");
+      current = overlap + "\n\n" + pageText;
       currentStart = pageNum;
     } else {
       current = combined;
@@ -202,6 +240,19 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   // 2. Extract text
   const pages = extractTextFromPdfBytes(pdfBytes);
   pdfBytes = null;
+
+  // Quality gate: fail fast if extracted text is unreadable
+  const combinedText = pages.join(" ");
+  const printableChars = (combinedText.match(/[\x20-\x7E]/g) || []).length;
+  const printableRatio = combinedText.length > 0 ? printableChars / combinedText.length : 0;
+  const isPlaceholder = combinedText.trim() === "[No extractable text found in PDF]";
+  if (isPlaceholder || printableRatio < 0.5 || combinedText.trim().length < 100) {
+    throw new Error(
+      `PDF text extraction failed (printable ratio: ${(printableRatio * 100).toFixed(0)}%). ` +
+      `The file may be scanned, encrypted, or use an unsupported encoding.`
+    );
+  }
+
   await supabase.from("reports").update({ page_count: pages.length }).eq("id", reportId);
 
   // 3. Chunk
@@ -216,7 +267,7 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
   const allEmbeddings: number[][] = [];
   for (let i = 0; i < textsForEmbedding.length; i += EMBED_BATCH) {
     const batch = textsForEmbedding.slice(i, i + EMBED_BATCH);
-    const embeddings = await openaiEmbeddingBatch(batch);
+    const embeddings = await withRetry(() => openaiEmbeddingBatch(batch));
     allEmbeddings.push(...embeddings);
   }
 
@@ -238,7 +289,23 @@ async function processReport(reportId: string, batchId: string, themes: any[], t
 
   // 5. Extract claims via LLM
   const allText = rawChunks.map((c) => `[Pages ${c.pageStart}-${c.pageEnd}]\n${c.text}`).join("\n\n---\n\n");
-  const truncatedText = allText.slice(0, 30000);
+
+  // Proportional sampling: sample beginning, middle, and end to cover the full document
+  const MAX_CHARS = 30000;
+  let truncatedText: string;
+  if (allText.length <= MAX_CHARS) {
+    truncatedText = allText;
+  } else {
+    const third = Math.floor(MAX_CHARS / 3);
+    const mid = Math.floor(allText.length / 2);
+    truncatedText = [
+      allText.slice(0, third),
+      "\n\n---[middle section]---\n\n",
+      allText.slice(mid - Math.floor(third / 2), mid + Math.floor(third / 2)),
+      "\n\n---[end section]---\n\n",
+      allText.slice(allText.length - third),
+    ].join("");
+  }
 
   const claimPrompt = `You are analyzing a hotel industry trend report. Extract 12-30 key claims from this report.
 
@@ -255,7 +322,10 @@ Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Report text:
 ${truncatedText}`;
 
-  const claimResponse = await llmChat([{ role: "user", content: claimPrompt }], 0.1, 8000);
+  const claimResponse = await withRetry(() => llmChat([
+    { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+    { role: "user", content: claimPrompt },
+  ], 0.1, 8000));
 
   let claims: any[];
   try {
@@ -320,14 +390,23 @@ For each claim, return a JSON array of objects with:
 
 Return ONLY a valid JSON array.`;
 
-      const mappingResponse = await llmChat([{ role: "user", content: mappingPrompt }], 0.1, 4000);
+      const mappingResponse = await withRetry(() => llmChat([
+        { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+        { role: "user", content: mappingPrompt },
+      ], 0.1, 4000));
       try {
         const mappings = robustJsonParse(mappingResponse);
+        const validThemeIds = new Set(themes.map((t: any) => t.theme_id));
 
         const rows = mappings
           .filter((m: any) => {
             const idx = (m.claim_index || 1) - 1;
-            return idx >= 0 && idx < claimRecords.length;
+            if (idx < 0 || idx >= claimRecords.length) return false;
+            if (!validThemeIds.has(m.theme_id)) {
+              console.warn(`LLM returned unknown theme_id "${m.theme_id}" — skipping`);
+              return false;
+            }
+            return true;
           })
           .map((m: any) => ({
             claim_id: claimRecords[(m.claim_index || 1) - 1].id,
@@ -370,14 +449,23 @@ Return a JSON array of objects (only for claims that clearly relate to a tension
 
 Return ONLY a valid JSON array. If no claims match, return [].`;
 
-      const tensionResponse = await llmChat([{ role: "user", content: tensionPrompt }], 0.1, 3000);
+      const tensionResponse = await withRetry(() => llmChat([
+        { role: "system", content: "You are a JSON API. Respond ONLY with a valid JSON array. No prose, no markdown fences, no explanation — raw JSON only." },
+        { role: "user", content: tensionPrompt },
+      ], 0.1, 3000));
       try {
         const tensionMappings = robustJsonParse(tensionResponse);
+        const validTensionIds = new Set(tensions.map((t: any) => t.tension_id));
 
         const rows = tensionMappings
           .filter((tm: any) => {
             const idx = (tm.claim_index || 1) - 1;
-            return idx >= 0 && idx < claimRecords.length;
+            if (idx < 0 || idx >= claimRecords.length) return false;
+            if (!validTensionIds.has(tm.tension_id)) {
+              console.warn(`LLM returned unknown tension_id "${tm.tension_id}" — skipping`);
+              return false;
+            }
+            return true;
           })
           .map((tm: any) => ({
             tension_id: tm.tension_id,
@@ -508,18 +596,27 @@ serve(async (req) => {
     let processed = currentBatch?.reports_processed || 0;
     const errors: string[] = [];
 
-    for (const report of reports) {
-      try {
-        const result = await processReport(report.id, batch_id, themes || [], tensions || []);
-        totalClaims += result.claimsExtracted;
+    const results = await Promise.all(
+      reports.map(async (report) => {
+        try {
+          const result = await processReport(report.id, batch_id, themes || [], tensions || []);
+          return { ok: true, claimsExtracted: result.claimsExtracted };
+        } catch (err: any) {
+          console.error(`Report ${report.id} failed:`, err.message);
+          await supabase.from("reports").update({ status: "failed", error_message: err.message }).eq("id", report.id);
+          errors.push(`${report.id}: ${err.message}`);
+          return { ok: false, claimsExtracted: 0 };
+        }
+      })
+    );
+
+    for (const r of results) {
+      if (r.ok) {
+        totalClaims += r.claimsExtracted;
         processed++;
-        await supabase.from("ingestion_batches").update({ reports_processed: processed, claims_extracted: totalClaims }).eq("id", batch_id);
-      } catch (err: any) {
-        console.error(`Report ${report.id} failed:`, err.message);
-        await supabase.from("reports").update({ status: "failed", error_message: err.message }).eq("id", report.id);
-        errors.push(`${report.id}: ${err.message}`);
       }
     }
+    await supabase.from("ingestion_batches").update({ reports_processed: processed, claims_extracted: totalClaims }).eq("id", batch_id);
 
     // Check if more pending reports remain
     const { data: remaining } = await supabase.from("reports").select("id").eq("batch_id", batch_id).eq("status", "pending").limit(1);
@@ -528,7 +625,15 @@ serve(async (req) => {
     if (!hasMore) {
       await computeScores(batch_id);
 
-      const finalStatus = errors.length === reports.length ? "failed" : "succeeded";
+      // Use batch-level totals from DB, not just this invocation's local errors
+      const { data: batchReports } = await supabase
+        .from("reports")
+        .select("status")
+        .eq("batch_id", batch_id);
+      const totalInBatch = batchReports?.length || 0;
+      const failedInBatch = batchReports?.filter((r: any) => r.status === "failed").length || 0;
+      const failureRate = totalInBatch > 0 ? failedInBatch / totalInBatch : 0;
+      const finalStatus = failureRate > 0.5 ? "failed" : "succeeded";
       await supabase.from("ingestion_batches").update({
         status: finalStatus,
         completed_at: new Date().toISOString(),
@@ -539,8 +644,8 @@ serve(async (req) => {
     await supabase.from("audit_logs").insert({
       batch_id,
       action: "ingestion_complete",
-      model_provider: "lovable-ai-gateway",
-      model_name: "gemini-2.5-flash / text-embedding-3-small",
+      model_provider: "openai",
+      model_name: "gpt-4o-mini / text-embedding-3-small",
       details: { reports_processed: processed, claims_extracted: totalClaims, errors },
     });
 
